@@ -1,1 +1,6 @@
+/debug
+/eval_logs*
+/logs
+/calvin
+
 *__pycache__*

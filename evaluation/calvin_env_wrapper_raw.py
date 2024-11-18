@@ -76,6 +76,7 @@ class CalvinEnvWrapperRaw(gym.Wrapper):
         if self.relative_actions:
             action = action_tensor.squeeze().cpu().detach().numpy()
             assert len(action) == 7
+            action[-1] = 1 if action[-1] > 0 else -1
         else:
             if action_tensor.shape[-1] == 7:
                 slice_ids = [3, 6]
@@ -85,7 +86,8 @@ class CalvinEnvWrapperRaw(gym.Wrapper):
                 logger.error("actions are required to have length 8 (for euler angles) or 9 (for quaternions)")
                 raise NotImplementedError
             action = np.split(action_tensor.squeeze().cpu().detach().numpy(), slice_ids)
-        action[-1] = 1 if action[-1] > 0 else -1
+            action[-1][-1] = 1 if action[-1][-1] > 0 else -1
+
         o, r, d, i = self.env.step(action)
 
         # obs = self.transform_observation(o)
