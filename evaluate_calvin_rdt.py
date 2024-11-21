@@ -28,6 +28,7 @@ import argparse
 import json
 import logging
 import os
+from typing import List
 from pathlib import Path
 import sys
 import time
@@ -54,9 +55,10 @@ from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from termcolor import colored
 import torch
+import torch.multiprocessing as mp
 from tqdm.auto import tqdm
 
-from evaluation.calvin_evaluation import GR1CalvinEvaluation
+#from evaluation.calvin_evaluation import GR1CalvinEvaluation
 from utils.calvin_utils import print_and_save
 
 logger = logging.getLogger(__name__)
@@ -191,7 +193,8 @@ def make_env(dataset_path, observation_space, device_id):
     return env
 
 
-def evaluate_policy(model, env, eval_sr_path, eval_result_path, eval_dir=None, debug=False):
+def evaluate_policy(model, env, eval_sr_path, eval_result_path, eval_dir=None, debug=False,
+                    total_gpus: int = 1, rel_gpu_id: int = 0):
     conf_dir = Path(f"{CALVIN_ROOT}/calvin_models") / "conf"
     task_cfg = OmegaConf.load(conf_dir / "callbacks/rollout/tasks/new_playtable_tasks.yaml")
     task_oracle = hydra.utils.instantiate(task_cfg)
@@ -199,9 +202,16 @@ def evaluate_policy(model, env, eval_sr_path, eval_result_path, eval_dir=None, d
     eval_dir = get_log_dir(eval_dir)
     eval_sequences = get_sequences(NUM_SEQUENCES)
 
+    # Split eval_sequences
+    seq_len_on_each_gpu = NUM_SEQUENCES // total_gpus
+    seq_left = seq_len_on_each_gpu * rel_gpu_id
+    seq_right = min(seq_left + seq_len_on_each_gpu, NUM_SEQUENCES)
+    eval_sequences = eval_sequences[seq_left:seq_right]
+    print(f"[Rank@{rel_gpu_id}] Evaluating {len(eval_sequences)} sequences: [{seq_left}, {seq_right}]")
+
     results = []
     if not debug:
-        eval_sequences = tqdm(eval_sequences, position=0, leave=True)
+        eval_sequences = tqdm(eval_sequences, position=rel_gpu_id, leave=True)
 
     sequence_i = 0
     for initial_state, eval_sequence in eval_sequences:
@@ -218,7 +228,8 @@ def evaluate_policy(model, env, eval_sr_path, eval_result_path, eval_dir=None, d
                 line += "\n"
                 f.write(line)
             description = " ".join([f"{i + 1}/5 : {v * 100:.1f}% |" for i, v in enumerate(success_list)])
-            description += f" Average: {average_rate:.1f} |"
+            description += f" Average: {average_rate:.3f} |"
+            description = f"[Rank{rel_gpu_id}]:{description}"
             eval_sequences.set_description(description)
         else:
             sequence_i += 1
@@ -371,7 +382,7 @@ def rollout(env, model: RoboticDiffusionTransformerModel, task_oracle, subtask, 
     # exit(0)
     state_vec, state_mask = robot_obs_to_state_vec(obs["robot_obs"])
     lang_annotation = val_annotations[subtask][0]
-    print("lang_annotation", lang_annotation)
+    # print("lang_annotation", lang_annotation)
 
     state_history = [state_vec, state_vec]
     state_mask_history = [state_mask, state_mask]
@@ -454,7 +465,7 @@ import yaml
 
 from calvin_model import create_model
 
-def make_policy():
+def make_policy(weight_path: str, is_hdfree: bool = False, device: str = "cuda"):
     with open("configs/base.yaml", "r") as fp:
         config = yaml.safe_load(fp)
 
@@ -465,55 +476,112 @@ def make_policy():
     pretrained_model_name_or_path = "/mnt/dongxu-fs2/data-hdd/mingyang/projs/RoboticsDiffusionTransformer/checkpoints/rdt-finetune-calvin-1b-v3/checkpoint-36000"
     # pretrained_model_name_or_path = "robotics-diffusion-transformer/rdt-1b"
 
+    pretrained_model_name_or_path = weight_path
+
     pretrained_text_encoder_name_or_path = "google/t5-v1_1-xxl"
     pretrained_vision_encoder_name_or_path = "google/siglip-so400m-patch14-384"
     model = create_model(
         args=config,
+        device=device,
         dtype=torch.bfloat16,
         pretrained=pretrained_model_name_or_path,
         pretrained_text_encoder_name_or_path=pretrained_text_encoder_name_or_path,
         pretrained_vision_encoder_name_or_path=pretrained_vision_encoder_name_or_path,
         control_frequency=30,
+        is_hdfree=is_hdfree,
     )
 
     return model
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate a trained model on multistep sequences with language goals.")
-    parser.add_argument("--dataset_dir", default='task_ABCD_D/', type=str, help="Dataset directory.")
-    parser.add_argument("--debug", action="store_true", help="Print debug info and visualize environment.")
-    parser.add_argument('--eval_dir', default="./eval_logs_rdt", type=str, help="Directory to save evaluation results")
-    parser.add_argument('--device', default=0, type=int, help="CUDA device")
-    args = parser.parse_args()
+def main_worker(gpu_id: int, args, device_ids: List[int], results):
+    """
+    Worker function for each GPU process.
+    """
+    # Initialize environment and model for this process
+    torch.cuda.set_device(torch.device(f"cuda:{gpu_id}"))
+    print(f"Running on GPU {gpu_id}")
+    rel_gpu_id = device_ids.index(int(gpu_id))
 
-    seed_everything(0, workers=True)  # type:ignore
+    # Load the model
+    model = make_policy(args.weight_path, args.hdfree, gpu_id)
 
-    device = torch.device('cuda', args.device)
-
-    model = make_policy()
-    # model = None
-
+    # Define observation space and create environment
     observation_space = {
         'rgb_obs': ['rgb_static', 'rgb_gripper'],
         'depth_obs': [],
         'state_obs': ['robot_obs'],
         'actions': ['actions'],
         'language': ['language']}
-    env = make_env(args.dataset_dir, observation_space, args.device)
+    env = make_env(args.dataset_dir, observation_space, gpu_id)
 
+    # Perform evaluation
+    eval_sr_path = os.path.join(args.eval_dir, f"success_rate_gpu@{gpu_id}.txt")
+    eval_result_path = os.path.join(args.eval_dir, f"result_gpu@{gpu_id}.txt")
+    eval_results = evaluate_policy(
+        model=model,
+        env=env,
+        eval_sr_path=eval_sr_path,
+        eval_result_path=eval_result_path,
+        eval_dir=args.eval_dir,
+        debug=args.debug,
+        total_gpus=len(device_ids),
+        rel_gpu_id=rel_gpu_id,
+    )
+    results[gpu_id] = eval_results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate a trained model on multistep sequences with language goals.")
+    parser.add_argument("--dataset_dir", default='task_ABCD_D/', type=str, help="Dataset directory.")
+    parser.add_argument("--weight_path",
+                        default='/mnt/dongxu-fs2/data-hdd/mingyang/projs/RoboticsDiffusionTransformer/checkpoints/rdt-finetune-calvin-1b-v3/checkpoint-36000',
+                        type=str, help="Trained weights.")
+    parser.add_argument("--hdfree", action="store_true", help="Default: False. If True, using HDFree (rdt with ia3 adapters).")
+    parser.add_argument("--debug", action="store_true", help="Print debug info and visualize environment.")
+    parser.add_argument('--eval_dir', default="./eval_logs_rdt", type=str, help="Directory to save evaluation results")
+    parser.add_argument('--device', default="0", type=str, help="CUDA devices, can be `0,1,2,3` ")
+    parser.add_argument('--seed', default=0, type=int, help="Random seed")
+    args = parser.parse_args()
+
+    # Ensure evaluation directory exists
     if not os.path.exists(args.eval_dir):
         os.makedirs(args.eval_dir, exist_ok=True)
+
+    seed_everything(args.seed, workers=True)  # type:ignore
+
+    # Parse GPU devices
+    device_ids = [int(d) for d in args.device.split(',')]
+
+    # Create shared list for storing results
+    manager = mp.Manager()
+    results = manager.dict()
+
+    # Launch parallel evaluation
+    processes = []
+    for gpu_id in device_ids:
+        p = mp.Process(target=main_worker, args=(gpu_id, args, device_ids, results))
+        processes.append(p)
+        p.start()
+
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+
+    # Merge results from all GPUs
+    print("All results:", results)
+    merged_results = []
+    for result in results.values():
+        merged_results.extend(result)
+    success_list = count_success(merged_results)
+    average_rate = sum(success_list) / len(success_list) * 5
+    description = " ".join([f"{i + 1}/5 : {v * 100:.1f}% |" for i, v in enumerate(success_list)])
+    description += f" Average: {average_rate:.3f} |"
+
     eval_sr_path = os.path.join(args.eval_dir, "success_rate.txt")
-    eval_result_path = os.path.join(args.eval_dir, "result.txt")
-    evaluate_policy(
-        model,
-        env,
-        eval_sr_path,
-        eval_result_path,
-        args.eval_dir,
-        debug=args.debug
-    )
+    with open(eval_sr_path, "w") as f:
+        f.write(f"Final result: {description}\n")
+    print(f"Final result: {description}")
 
 
 if __name__ == "__main__":
