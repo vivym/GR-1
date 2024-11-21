@@ -9,7 +9,7 @@
 # GLIDE: https://github.com/openai/glide-text2im
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
-from __future__ import annotations
+
 
 import math
 from collections import OrderedDict
@@ -29,6 +29,7 @@ class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
+
     def __init__(self, hidden_size, frequency_embedding_size=256, dtype=torch.bfloat16):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -74,6 +75,7 @@ class CrossAttention(nn.Module):
     A cross-attention layer with flash attention.
     """
     fused_attn: Final[bool]
+
     def __init__(
             self,
             dim: int,
@@ -98,13 +100,21 @@ class CrossAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-    
-    def forward(self, x: torch.Tensor, c: torch.Tensor, 
-                mask: torch.Tensor | None = None) -> torch.Tensor:
+
+        # Used by Domain Adaptation
+        self.has_adapter = False
+        self.n_kv_dim = dim * 2
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
         _, L, _ = c.shape
         q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        kv = self.kv(c).reshape(B, L, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        if not self.has_adapter:
+            kv = self.kv(c)
+        else:
+            kv = self.kv(c) * self.ia3_kv
+        kv = kv.reshape(B, L, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
@@ -112,7 +122,7 @@ class CrossAttention(nn.Module):
         if mask is not None:
             mask = mask.reshape(B, 1, 1, L)
             mask = mask.expand(-1, -1, N, -1)
-        
+
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 query=q,
@@ -130,12 +140,18 @@ class CrossAttention(nn.Module):
             if self.attn_drop.p > 0:
                 attn = self.attn_drop(attn)
             x = attn @ v
-            
+
         x = x.permute(0, 2, 1, 3).reshape(B, N, C)
         x = self.proj(x)
         if self.proj_drop.p > 0:
             x = self.proj_drop(x)
         return x
+
+    def register_adapter(self):
+        self.has_adapter = True
+        self.register_parameter('ia3_kv', nn.Parameter(torch.ones(self.n_kv_dim),
+                                                       requires_grad=True))  # together
+        print("[DEBUG] ia3_kv registered!")
 
 
 #################################################################################
@@ -145,56 +161,72 @@ class RDTBlock(nn.Module):
     """
     A RDT block with cross-attention conditioning.
     """
+
     def __init__(self, hidden_size, num_heads, **block_kwargs):
         super().__init__()
         self.norm1 = RmsNorm(hidden_size, eps=1e-6)
         self.attn = Attention(
-            dim=hidden_size, num_heads=num_heads, 
-            qkv_bias=True, qk_norm=True, 
-            norm_layer=RmsNorm,**block_kwargs)
+            dim=hidden_size, num_heads=num_heads,
+            qkv_bias=True, qk_norm=True,
+            norm_layer=RmsNorm, **block_kwargs)
         self.cross_attn = CrossAttention(
-            hidden_size, num_heads=num_heads, 
-            qkv_bias=True, qk_norm=True, 
-            norm_layer=RmsNorm,**block_kwargs)
-        
+            hidden_size, num_heads=num_heads,
+            qkv_bias=True, qk_norm=True,
+            norm_layer=RmsNorm, **block_kwargs)
+
         self.norm2 = RmsNorm(hidden_size, eps=1e-6)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.ffn = Mlp(in_features=hidden_size, 
-            hidden_features=hidden_size, 
-            act_layer=approx_gelu, drop=0)
+        self.ffn = Mlp(in_features=hidden_size,
+                       hidden_features=hidden_size,
+                       act_layer=approx_gelu, drop=0)
         self.norm3 = RmsNorm(hidden_size, eps=1e-6)
+
+        self.has_adapter = False
+        self.cache_mlp_out = None
 
     def forward(self, x, c, mask=None):
         origin_x = x
         x = self.norm1(x)
         x = self.attn(x)
         x = x + origin_x
-        
+
         origin_x = x
         x = self.norm2(x)
         x = self.cross_attn(x, c, mask)
         x = x + origin_x
-                
+
         origin_x = x
         x = self.norm3(x)
         x = self.ffn(x)
         x = x + origin_x
-        
+        self.cache_mlp_out = x
+
         return x
+
+    def register_adapter(self):
+        self.has_adapter = True
+        self.cross_attn.register_adapter()
+
+    def unfreeze_adapter(self):
+        if not self.cross_attn.has_adapter:
+            print("[Warning] Adapter not found! Now register it!")
+            self.register_adapter()
+        self.cross_attn.ia3_kv.requires_grad = True
 
 
 class FinalLayer(nn.Module):
     """
     The final layer of RDT.
     """
+
     def __init__(self, hidden_size, out_channels):
         super().__init__()
         self.norm_final = RmsNorm(hidden_size, eps=1e-6)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.ffn_final = Mlp(in_features=hidden_size,
-            hidden_features=hidden_size,
-            out_features=out_channels, 
-            act_layer=approx_gelu, drop=0)
+                             hidden_features=hidden_size,
+                             out_features=out_channels,
+                             act_layer=approx_gelu, drop=0)
 
     def forward(self, x):
         x = self.norm_final(x)
@@ -215,15 +247,15 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=np.float64)
     omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
+    omega = 1. / 10000 ** omega  # (D/2,)
 
     if not isinstance(pos, np.ndarray):
         pos = np.array(pos, dtype=np.float64)
     pos = pos.reshape(-1)  # (M,)
     out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
@@ -258,12 +290,12 @@ def get_nd_sincos_pos_embed_from_grid(embed_dim, grid_sizes):
     return emb
 
 
-def get_multimodal_cond_pos_embed(embed_dim, mm_cond_lens: OrderedDict, 
+def get_multimodal_cond_pos_embed(embed_dim, mm_cond_lens: OrderedDict,
                                   embed_modality=True):
     """
-    Generate position embeddings for multimodal conditions. 
-    
-    mm_cond_lens: an OrderedDict containing 
+    Generate position embeddings for multimodal conditions.
+
+    mm_cond_lens: an OrderedDict containing
         (modality name, modality token length) pairs.
         For `"image"` modality, the value can be a multi-dimensional tuple.
         If the length < 0, it means there is no position embedding for the modality or grid.
@@ -282,12 +314,12 @@ def get_multimodal_cond_pos_embed(embed_dim, mm_cond_lens: OrderedDict,
     else:
         # The whole embedding is for position embeddings
         pos_embed_dim = embed_dim
-    
+
     # Get embeddings for positions inside each modality
     c_pos_emb = np.zeros((0, embed_dim))
     for idx, (modality, cond_len) in enumerate(mm_cond_lens.items()):
         if modality == "image" and \
-            (isinstance(cond_len, tuple) or isinstance(cond_len, list)):
+                (isinstance(cond_len, tuple) or isinstance(cond_len, list)):
             all_grid_sizes = tuple([abs(x) for x in cond_len])
             embed_grid_sizes = tuple([x if x > 0 else 1 for x in cond_len])
             cond_sincos_embed = get_nd_sincos_pos_embed_from_grid(
@@ -302,5 +334,5 @@ def get_multimodal_cond_pos_embed(embed_dim, mm_cond_lens: OrderedDict,
             cond_pos_embed[:, -pos_embed_dim:] += cond_sincos_embed
         cond_pos_embed += modality_pos_embed[idx]
         c_pos_emb = np.concatenate([c_pos_emb, cond_pos_embed], axis=0)
-    
+
     return c_pos_emb

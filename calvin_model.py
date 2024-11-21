@@ -9,6 +9,7 @@ from configs.state_vec import STATE_VEC_IDX_MAPPING
 from models.multimodal_encoder.siglip_encoder import SiglipVisionTower
 from models.multimodal_encoder.t5_encoder import T5Embedder
 from models.rdt_runner import RDTRunner
+from models.hdfree_runner import HDFreeRunner
 
 
 # The indices that the raw vector should be mapped to in the unified action vector
@@ -51,6 +52,7 @@ class RoboticDiffusionTransformerModel(object):
         pretrained=None,
         pretrained_text_encoder_name_or_path=None,
         pretrained_vision_encoder_name_or_path=None,
+        is_hdfree=False,
     ):
         self.args = args
         self.dtype = dtype
@@ -59,24 +61,64 @@ class RoboticDiffusionTransformerModel(object):
         self.control_frequency = control_frequency
         self.text_tokenizer, self.text_model = self.get_text_encoder(pretrained_text_encoder_name_or_path)
         self.image_processor, self.vision_model = self.get_vision_encoder(pretrained_vision_encoder_name_or_path)
+        self.is_hdfree = is_hdfree
+
         self.policy = self.get_policy(pretrained)
 
         self.reset()
+        print(f"[DEBUG] model loaded. is_hdfree: {self.is_hdfree}")
 
     def get_policy(self, pretrained):
         """Initialize the model."""
         # Initialize model with arguments
-        if (
-            pretrained is None
-            or os.path.isfile(pretrained)
-        ):
+        if not self.is_hdfree:
+            # Original RDT
+            if (
+                pretrained is None
+                or os.path.isfile(pretrained)
+            ):
+                img_cond_len = (
+                    self.args["common"]["img_history_size"]
+                    * self.args["common"]["num_cameras"]
+                    * self.vision_model.num_patches
+                )
+
+                _model = RDTRunner(
+                    action_dim=self.args["common"]["state_dim"],
+                    pred_horizon=self.args["common"]["action_chunk_size"],
+                    config=self.args["model"],
+                    lang_token_dim=self.args["model"]["lang_token_dim"],
+                    img_token_dim=self.args["model"]["img_token_dim"],
+                    state_token_dim=self.args["model"]["state_token_dim"],
+                    max_lang_cond_len=self.args["dataset"]["tokenizer_max_length"],
+                    img_cond_len=img_cond_len,
+                    img_pos_embed_config=[
+                        # No initial pos embed in the last grid size
+                        # since we've already done in ViT
+                        ("image", (self.args["common"]["img_history_size"],
+                            self.args["common"]["num_cameras"],
+                            -self.vision_model.num_patches)),
+                    ],
+                    lang_pos_embed_config=[
+                        # Similarly, no initial pos embed for language
+                        ("lang", -self.args["dataset"]["tokenizer_max_length"]),
+                    ],
+                    dtype=self.dtype,
+                )
+                print("[RoboticDiffusionTransformerModel] RDTRunner loaded from scratch.")
+            else:
+                _model = RDTRunner.from_pretrained(pretrained)
+                print(f"[RoboticDiffusionTransformerModel] RDTRunner loaded from: {pretrained}.")
+
+        else:
+            # HDFree version of RDT, registered with ia3_adapters
             img_cond_len = (
-                self.args["common"]["img_history_size"]
-                * self.args["common"]["num_cameras"]
-                * self.vision_model.num_patches
+                    self.args["common"]["img_history_size"]
+                    * self.args["common"]["num_cameras"]
+                    * self.vision_model.num_patches
             )
 
-            _model = RDTRunner(
+            _model = HDFreeRunner(
                 action_dim=self.args["common"]["state_dim"],
                 pred_horizon=self.args["common"]["action_chunk_size"],
                 config=self.args["model"],
@@ -98,8 +140,16 @@ class RoboticDiffusionTransformerModel(object):
                 ],
                 dtype=self.dtype,
             )
-        else:
-            _model = RDTRunner.from_pretrained(pretrained)
+            _model.register_modules_for_target()
+
+            from safetensors.torch import load_model
+            ema_weight = os.path.join(pretrained, "ema", "model.safetensors")
+            load_model(_model, ema_weight)
+
+            for name, p in _model.named_parameters():
+                if "ia3" in name:
+                    print(name)
+            print(f"[RoboticDiffusionTransformerModel] HDFreeRunner loaded from: {ema_weight}.")
 
         return _model
 
@@ -144,7 +194,7 @@ class RoboticDiffusionTransformerModel(object):
         else:
             raise NotImplementedError(f"Unknown checkpoint format: {pretrained}")
 
-    def encode_instruction(self, instruction, device="cuda"):
+    def encode_instruction(self, instruction, device=None):
         """Encode string instruction to latent embeddings.
 
         Args:
@@ -158,7 +208,7 @@ class RoboticDiffusionTransformerModel(object):
             instruction, return_tensors="pt",
             padding="longest",
             truncation=True
-        )["input_ids"].to(device)
+        )["input_ids"].to(self.device)
 
         tokens = tokens.view(1, -1)
         with torch.no_grad():
