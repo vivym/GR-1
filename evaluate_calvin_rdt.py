@@ -400,7 +400,7 @@ def rollout(env, model: RoboticDiffusionTransformerModel, task_oracle, subtask, 
     start_info = env.get_info()
     if debug:
         img_list = []
-    horizon = 8
+    horizon = 16
     for step in range(EP_LEN):
         if step % horizon == 0:
             state_vec = state_history[-1][None]
